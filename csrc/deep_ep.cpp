@@ -1091,6 +1091,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Te
 Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                              const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
                              const std::optional<torch::Tensor>& dispatch_wait_recv_cost_stats,
+                             const std::optional<torch::Tensor>& static_scale,
                              int num_max_dispatch_tokens_per_rank, int num_experts,
                              bool use_fp8, bool round_scale, bool use_ue8m0,
                              bool async, bool return_recv_hook) {
@@ -1106,6 +1107,8 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
 
+    bool use_static_quant = false;
+
     // Diagnosis tensors
     if (cumulative_local_expert_recv_stats.has_value()) {
         EP_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
@@ -1116,6 +1119,13 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
         EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->scalar_type() == torch::kInt64);
         EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->dim() == 1 and dispatch_wait_recv_cost_stats->is_contiguous());
         EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->size(0) == num_ranks);
+    }
+    if (static_scale.has_value()) {
+        EP_HOST_ASSERT(use_fp8 && !use_ue8m0);
+        EP_HOST_ASSERT(static_scale->scalar_type() == torch::kFloat32);
+        EP_HOST_ASSERT(static_scale->dim() == 1 and static_scale->is_contiguous());
+        EP_HOST_ASSERT(static_scale->size(0) == 1 or static_scale->size(0) == x.size(1));
+        use_static_quant = true;
     }
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
@@ -1148,7 +1158,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     void* packed_recv_x_scales_ptr = nullptr;
     EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
 
-    if (use_fp8) {
+    if (use_fp8 && !use_static_quant) {
         // TODO: support unaligned cases
         EP_HOST_ASSERT(hidden % 512 == 0);
         if (not use_ue8m0) {
@@ -1173,11 +1183,11 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
                                dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
                                buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
                                buffer.dispatch_rdma_send_buffer,
-                               x.data_ptr(), topk_idx.data_ptr<int64_t>(),
+                               x.data_ptr(), topk_idx.data_ptr<int64_t>(), static_scale.data_ptr(),
                                next_clean_meta.first, next_clean_meta.second,
                                num_tokens, hidden, num_max_dispatch_tokens_per_rank,
                                num_topk, num_experts, rank, num_ranks,
-                               use_fp8, round_scale, use_ue8m0,
+                               use_fp8, round_scale, use_ue8m0, use_static_quant,
                                workspace, num_device_sms,
                                launch_stream, phases);
     };
