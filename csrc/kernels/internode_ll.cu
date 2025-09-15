@@ -147,10 +147,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     rdma_x_vec[i] = int2_value;
                 } else if (kUseFP8 and kUseStaticQuant) {
                     // Use static scale
-                    EP_HOST_ASSERT(static_scale != nullptr);
                     // TODO: Add support for per token/block static quant
-                    EP_HOST_ASSERT(static_scale->size(0) == 1 and static_scale->is_contiguous());
-                    float scale = static_scale->size(0) == 1 ? static_scale->data_ptr<float>()[0];
+                    float scale = static_scale[0];
                     scale = 1.0f / scale;
 
                     // Cast into send buffer
@@ -159,7 +157,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     auto fp8x2_values = reinterpret_cast<__nv_fp8x2_storage_t*>(&int2_value);
                     #pragma unroll
                     for (int j = 0; j < kNumElemsPerRead; j += 2) {
-                        float2 fp32x2 = { fmax(fmin(static_cast<float>(bf16_values[j]) * scale, kFinfoAmaxE4M3), -kFinfoAmaxE4M3)
+                        float2 fp32x2 = { fmax(fmin(static_cast<float>(bf16_values[j]) * scale, kFinfoAmaxE4M3), -kFinfoAmaxE4M3),
                                           fmax(fmin(static_cast<float>(bf16_values[j + 1]) * scale, kFinfoAmaxE4M3), -kFinfoAmaxE4M3)};
                         fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
                     }
