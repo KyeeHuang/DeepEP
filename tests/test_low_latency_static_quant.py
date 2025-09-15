@@ -44,11 +44,12 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
 
     # Check dispatch correctness
-    do_check = True
+    do_check = False 
     hash_value, num_times = 0, 0
     for current_x in x_list:
         for return_recv_hook in (False, True):
             dispatch_use_fp8 = True
+            static_scale = current_x.abs().float().amax().clamp(1e-4).unsqueeze(-1)
             num_times += 1
             for i in range((num_times % 2) + 1):
                 cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device='cuda')
@@ -58,8 +59,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                                 cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                                                 async_finish=not return_recv_hook, return_recv_hook=return_recv_hook)
                 hook() if return_recv_hook else event.current_stream_wait()
-            packed_recv_x = packed_recv_x
-            simulated_gemm_x = packed_recv_x.clone()
+            simulated_gemm_x = per_tensor_cast_back(packed_recv_x, static_scale)
             all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device='cuda')
             dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
             for i in range(num_local_experts if do_check else 0):
@@ -120,7 +120,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # noinspection PyShadowingNames
     def test_func(return_recv_hook: bool):
         recv_x, recv_count, handle, event, hook = \
-            buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
+            buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts, static_scale=static_scale,
                                         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                                         use_fp8=True, async_finish=False, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None

@@ -68,7 +68,6 @@ def per_tensor_cast_back(x_fp8: torch.Tensor, x_scales: torch.Tensor):
         x_scales = x_scales.view(dtype=torch.uint8).to(torch.int) << 23
         x_scales = x_scales.view(dtype=torch.float)
     x_fp32 = x_fp8.to(torch.float32).view(x_fp8.size(0), -1, 1)
-    x_scales = x_scales.view(x_fp8.size(0), -1, 1)
     return (x_fp32 * x_scales).view(x_fp8.shape).to(torch.bfloat16)
 
 def inplace_unique(x: torch.Tensor, num_slots: int):
