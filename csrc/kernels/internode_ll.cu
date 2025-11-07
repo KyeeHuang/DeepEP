@@ -1,7 +1,8 @@
 #include "configs.cuh"
 #include "exception.cuh"
 #include "ibgda_device.cuh"
-#include "launch.cuh"
+#include "utils.cuh"
+#include <sys/types.h>
 
 namespace deep_ep {
 
@@ -126,34 +127,21 @@ void clean_low_latency_buffer(int* clean_0,
                   sync_buffer_ptr);
 }
 
-template <bool kUseFP8, bool kUseUE8M0, int kHidden>
-__global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
-                                                    void* packed_recv_x_scales,
-                                                    int* packed_recv_src_info,
-                                                    int64_t* packed_recv_layout_range,
-                                                    int* packed_recv_count,
-                                                    int* mask_buffer_ptr,
-                                                    int* cumulative_local_expert_recv_stats,
-                                                    int64_t* dispatch_wait_recv_cost_stats,
-                                                    void* rdma_recv_x,
-                                                    int* rdma_recv_count,
-                                                    void* rdma_x,
-                                                    const void* x,
-                                                    const topk_idx_t* topk_idx,
-                                                    int* atomic_counter_per_expert,
-                                                    int* atomic_finish_counter_per_expert,
-                                                    int* next_clean,
-                                                    int num_next_clean_int,
-                                                    int num_tokens,
-                                                    int num_max_dispatch_tokens_per_rank,
-                                                    int num_topk,
-                                                    int num_experts,
-                                                    int rank,
-                                                    int num_ranks,
-                                                    int num_warp_groups,
-                                                    int num_warps_per_group,
-                                                    bool round_scale,
-                                                    int phases) {
+template <bool kUseFP8, bool kUseUE8M0, bool kUseStaticQuant, int kHidden>
+__global__ __launch_bounds__(1024, 1) void
+dispatch(void* packed_recv_x, void* packed_recv_x_scales,
+         int* packed_recv_src_info, int64_t* packed_recv_layout_range,
+         int* packed_recv_count,
+         int* cumulative_local_expert_recv_stats,
+         int64_t* dispatch_wait_recv_cost_stats,
+         void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
+         const void* x, const int64_t* topk_idx, const float* static_scale,
+         int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
+         int* next_clean, int num_next_clean_int,
+         int num_tokens, int num_max_dispatch_tokens_per_rank,
+         int num_topk, int num_experts, int rank, int num_ranks,
+         int num_warp_groups, int num_warps_per_group,
+         bool round_scale, int phases) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();
@@ -178,7 +166,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     // Message package: index at source (int), 3 reserved int fields, hidden data, FP8 scales
     // NOTES: currently we have 3 reserved int fields for future use
     using vec_t = std::conditional_t<kUseFP8, int2, int4>;
-    const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
+    const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + (!kUseStaticQuant ? num_scales * sizeof(float) : 0))
+                                                             : (kHidden * sizeof(nv_bfloat16)));
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
@@ -204,7 +193,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
             const auto x_int4 = static_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
             const auto rdma_x_src_idx = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_x) + token_idx * num_bytes_per_msg);
             const auto rdma_x_vec = reinterpret_cast<vec_t*>(reinterpret_cast<uint8_t*>(rdma_x_src_idx) + sizeof(int4));
-            const auto rdma_x_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes);
+            const auto rdma_x_scales = !kUseStaticQuant ? reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes)
+                                                        : nullptr;
 
             // Overlap top-k index read and source token index writes
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
@@ -217,7 +207,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                 // Read
                 auto int4_value = __ldg(x_int4 + i);
 
-                if constexpr (kUseFP8) {
+                if constexpr (kUseFP8 and not kUseStaticQuant) {
                     // Calculate local amax
                     auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
                     float fp32_values[kNumElemsPerRead];
@@ -241,6 +231,23 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                     #pragma unroll
                     for (int j = 0; j < kNumElemsPerRead; j += 2) {
                         float2 fp32x2 = {fp32_values[j] * scale, fp32_values[j + 1] * scale};
+                        fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
+                    }
+                    rdma_x_vec[i] = int2_value;
+                } else if (kUseFP8 and kUseStaticQuant) {
+                    // Use static scale
+                    // TODO: Add support for per token/block static quant
+                    float scale = static_scale[0];
+                    scale = 1.0f / scale;
+
+                    // Cast into send buffer
+                    auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
+                    vec_t int2_value;
+                    auto fp8x2_values = reinterpret_cast<__nv_fp8x2_storage_t*>(&int2_value);
+                    #pragma unroll
+                    for (int j = 0; j < kNumElemsPerRead; j += 2) {
+                        float2 fp32x2 = { fmax(fmin(static_cast<float>(bf16_values[j]) * scale, kFinfoAmaxE4M3), -kFinfoAmaxE4M3),
+                                          fmax(fmin(static_cast<float>(bf16_values[j + 1]) * scale, kFinfoAmaxE4M3), -kFinfoAmaxE4M3)};
                         fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
                     }
                     rdma_x_vec[i] = int2_value;
@@ -437,7 +444,7 @@ LOW_LATENCY_DISPATCH_RECV:
             UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, ld_nc_global, st_na_global);
 
             // Copy scales
-            if constexpr (kUseFP8) {
+            if constexpr (kUseFP8 and not kUseStaticQuant) {
                 // Equivalent CuTe layout:
                 //   (num_tokens, (num_packed, num_elems_per_pack)):(num_elems_per_pack, (num_tokens * num_elems_per_pack, 1))
                 const auto src_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
@@ -470,28 +477,15 @@ void dispatch(void* packed_recv_x,
               int* mask_buffer_ptr,
               int* cumulative_local_expert_recv_stats,
               int64_t* dispatch_wait_recv_cost_stats,
-              void* rdma_recv_x,
-              int* rdma_recv_count,
-              void* rdma_x,
-              const void* x,
-              const topk_idx_t* topk_idx,
-              int* next_clean,
-              int num_next_clean_int,
-              int num_tokens,
-              int hidden,
-              int num_max_dispatch_tokens_per_rank,
-              int num_topk,
-              int num_experts,
-              int rank,
-              int num_ranks,
-              bool use_fp8,
-              bool round_scale,
-              bool use_ue8m0,
-              void* workspace,
-              int num_device_sms,
-              cudaStream_t stream,
-              int phases) {
-    constexpr int kNumMaxTopK = 11;
+              void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
+              const void* x, const int64_t* topk_idx, const float* static_scale,
+              int* next_clean, int num_next_clean_int,
+              int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
+              int num_topk, int num_experts, int rank, int num_ranks,
+              bool use_fp8, bool round_scale, bool use_ue8m0, bool use_static_quant,
+              void* workspace, int num_device_sms,
+              cudaStream_t stream, int phases) {
+    constexpr int kNumMaxTopK = 9;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
     EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0);
@@ -510,44 +504,30 @@ void dispatch(void* packed_recv_x,
     if (use_ue8m0)
         EP_HOST_ASSERT(round_scale and "UE8M0 SF requires `round_scale=True`");
 
-#define DISPATCH_LAUNCH_CASE(hidden)                         \
-    {                                                        \
-        auto dispatch_func = dispatch<false, false, hidden>; \
-        if (use_fp8 and not use_ue8m0)                       \
-            dispatch_func = dispatch<true, false, hidden>;   \
-        if (use_fp8 and use_ue8m0)                           \
-            dispatch_func = dispatch<true, true, hidden>;    \
-        LAUNCH_KERNEL(&cfg,                                  \
-                      dispatch_func,                         \
-                      packed_recv_x,                         \
-                      packed_recv_x_scales,                  \
-                      packed_recv_src_info,                  \
-                      packed_recv_layout_range,              \
-                      packed_recv_count,                     \
-                      mask_buffer_ptr,                       \
-                      cumulative_local_expert_recv_stats,    \
-                      dispatch_wait_recv_cost_stats,         \
-                      rdma_recv_x,                           \
-                      rdma_recv_count,                       \
-                      rdma_x,                                \
-                      x,                                     \
-                      topk_idx,                              \
-                      atomic_counter_per_expert,             \
-                      atomic_finish_counter_per_expert,      \
-                      next_clean,                            \
-                      num_next_clean_int,                    \
-                      num_tokens,                            \
-                      num_max_dispatch_tokens_per_rank,      \
-                      num_topk,                              \
-                      num_experts,                           \
-                      rank,                                  \
-                      num_ranks,                             \
-                      num_warp_groups,                       \
-                      num_warps_per_group,                   \
-                      round_scale,                           \
-                      phases);                               \
-    }                                                        \
-    break
+#define DISPATCH_LAUNCH_CASE(hidden) { \
+auto dispatch_func = dispatch<false, false, false, hidden>; \
+if (use_fp8 and not use_ue8m0 and not use_static_quant) \
+    dispatch_func = dispatch<true, false, false, hidden>; \
+if (use_fp8 and use_ue8m0 and not use_static_quant) \
+    dispatch_func = dispatch<true, true, false, hidden>; \
+if (use_fp8 and not use_ue8m0 and use_static_quant) \
+    dispatch_func = dispatch<true, false, true, hidden>; \
+if (use_fp8 and use_ue8m0 and use_static_quant) \
+    dispatch_func = dispatch<true, true, true, hidden>; \
+LAUNCH_KERNEL(&cfg, dispatch_func, \
+              packed_recv_x, packed_recv_x_scales, \
+              packed_recv_src_info, packed_recv_layout_range, \
+              packed_recv_count, \
+              cumulative_local_expert_recv_stats, \
+              dispatch_wait_recv_cost_stats, \
+              rdma_recv_x, rdma_recv_count, rdma_x, \
+              x, topk_idx, static_scale, \
+              atomic_counter_per_expert, atomic_finish_counter_per_expert, \
+              next_clean, num_next_clean_int, \
+              num_tokens, num_max_dispatch_tokens_per_rank, \
+              num_topk, num_experts, rank, num_ranks, \
+              num_warp_groups, num_warps_per_group, \
+              round_scale, phases); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
