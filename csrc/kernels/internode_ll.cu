@@ -1,6 +1,7 @@
 #include "configs.cuh"
 #include "exception.cuh"
 #include "ibgda_device.cuh"
+#include "launch.cuh"
 #include "utils.cuh"
 #include <sys/types.h>
 
@@ -132,6 +133,7 @@ __global__ __launch_bounds__(1024, 1) void
 dispatch(void* packed_recv_x, void* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
          int* packed_recv_count,
+         int* mask_buffer_ptr,
          int* cumulative_local_expert_recv_stats,
          int64_t* dispatch_wait_recv_cost_stats,
          void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
@@ -518,6 +520,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
               packed_recv_count, \
+              mask_buffer_ptr, \
               cumulative_local_expert_recv_stats, \
               dispatch_wait_recv_cost_stats, \
               rdma_recv_x, rdma_recv_count, rdma_x, \
